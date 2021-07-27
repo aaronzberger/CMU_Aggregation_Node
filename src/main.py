@@ -1,33 +1,17 @@
 #!/home/aaron/py36/bin/python
 
 import rospy
-from rospy import topics
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
-import time
 from nav_msgs.msg import Odometry
-from interpolate_topic import Interpolation_Subscriber
 import numpy as np
 from ros_numpy.point_cloud2 import pointcloud2_to_xyz_array
 from scipy.spatial.transform import Rotation as R
-import ros_numpy
-import sys
+import message_filters
 
 # Define how many frames to aggregate into one pointcloud
-AGGREGATION_COUNT = 10
+AGGREGATION_COUNT = 5
 
-def get_default_message():
-    obj = PointCloud2()
-    obj.height = 1
-    obj.is_dense = True
-    obj.is_bigendian = False
-    # (8-bit int * [X, Y, Z, R] = 32 bits)
-    obj.point_step = 32
-    obj.fields = [PointField(name='x', offset=0, datatype=7, count=1),
-                  PointField(name='y', offset=4, datatype=7, count=1),
-                  PointField(name='z', offset=8, datatype=7, count=1),
-                  PointField(name='intensity', offset=16, datatype=7, count=1)]
-    return obj
 
 def point_cloud(points=None, parent_frame='velodyne'):
     '''
@@ -77,73 +61,53 @@ def point_cloud(points=None, parent_frame='velodyne'):
 
 class Aggregation_Node:
     def __init__(self):
-        self.sub_registered = rospy.Subscriber(
-            '/velodyne_points', PointCloud2, self.velodyne_callback)
-        self.sub_transform = Interpolation_Subscriber(
-            '/aft_mapped_to_init', Odometry,
-            get_fn=lambda data: [getattr(data.pose.pose.position, i) for i in 'xyz'] + \
-                                [getattr(data.pose.pose.orientation, i) for i in 'xyzw'])
+
+        self.sub_registered = message_filters.Subscriber(
+            '/velodyne_cloud_registered', PointCloud2)
+        self.sub_transform = message_filters.Subscriber(
+            '/aft_mapped_to_init', Odometry)
+        ts = message_filters.TimeSynchronizer(
+            [self.sub_registered, self.sub_transform], queue_size=20)
+        ts.registerCallback(self.velodyne_callback)
 
         self.pub_aggregated = rospy.Publisher(
             '/velodyne_aggregated', PointCloud2, queue_size=1)
         self.cloud_list = []
 
-    def velodyne_callback(self, data_velodyne):
-        transform_data = self.sub_transform.get(data_velodyne.header.stamp)
-        if transform_data is None:
-            return
-
-        def data_to_matrix(transform):
+    def velodyne_callback(self, data_velodyne, data_transform):
+        def odom_to_matrix(msg):
             frame = np.eye(4)
-            frame[:3, :3] = R.from_quat(transform[3:]).as_matrix()
-            frame[:3, 3] = transform[:3]
+            frame[:3, :3] = R.from_quat([getattr(msg.pose.pose.orientation, i) for i in 'xyzw']).as_matrix()
+            frame[:3, 3] = [getattr(msg.pose.pose.position, i) for i in 'xyz']
             return frame
 
-        self.cloud_list.append([point_cloud(), data_to_matrix(transform_data), data_velodyne.header.stamp])
-        self.cloud_list[-1][0].data = data_velodyne.data
-        self.cloud_list[-1][0].width = data_velodyne.width
-        print(sys.getsizeof(self.cloud_list[-1][0].data), self.cloud_list[-1][0].width)
-        print('Add new frame with width', self.cloud_list[-1][0].width)
+        np_lidar = pointcloud2_to_xyz_array(data_velodyne)
+        self.cloud_list.append(np_lidar)
 
-        for i in range(len(self.cloud_list[:-1])):
-            this_frame = data_to_matrix(transform_data)
+        if len(self.cloud_list) > AGGREGATION_COUNT:
+            self.cloud_list.pop(0)
 
-            # lidar_ = ros_numpy.numpify(data_velodyne)
-            # np_lidar = np.zeros((lidar_.shape[0], 3))
-            # np_lidar[:, 0] = lidar_['x']
-            # np_lidar[:, 1] = lidar_['y']
-            # np_lidar[:, 2] = lidar_['z']
-            # np_lidar[:, 3] = lidar_['intensity']
-            # np_lidar = np_lidar.astype(np.float32)
-
-            # print(np_lidar[180])
-
-            np_lidar = pointcloud2_to_xyz_array(data_velodyne)
+        final_cloud = np.empty((0, 4), dtype=np.float)
+        for cloud in self.cloud_list:
+            this_frame = odom_to_matrix(data_transform)
+            this_frame = np.linalg.inv(this_frame)
 
             # Pad with reflectances
-            np_lidar = np.concatenate(
-                (np_lidar, np.ones((np_lidar.shape[0], 1))), axis=1)
+            cloud = np.concatenate(
+                (cloud, np.ones((cloud.shape[0], 1))), axis=1)
 
-            np_lidar = np_lidar.transpose()
+            cloud = cloud.transpose()
 
-            # print(np_lidar.shape, self.cloud_list[i][1].shape, this_frame.shape)
-            transformed = self.cloud_list[i][1] @ this_frame @ np_lidar
+            transformed =  this_frame @ cloud
             transformed = transformed.transpose()
-            ros_transformed = point_cloud(transformed, 'velodyne')
-            self.cloud_list[i][0].data += ros_transformed.data
-            self.cloud_list[i][0].width += ros_transformed.width
-            print(sys.getsizeof(self.cloud_list[i][0].data), self.cloud_list[i][0].width)
-            print('added this cloud to index {}, from {} width to {}'.format(i, self.cloud_list[i][0].width - ros_transformed.width, self.cloud_list[i][0].width))
-        
-        print('widths', [item[0].width for item in self.cloud_list])
 
-        if len(self.cloud_list) >= AGGREGATION_COUNT:
-            pub_msg = self.cloud_list[0][0]
-            pub_msg.header = Header(stamp=self.cloud_list[0][2], frame_id='velodyne')
-            pub_msg.row_step = pub_msg.width * pub_msg.point_step
-            self.pub_aggregated.publish(pub_msg)
-            print('published index 0 with width', pub_msg.width)
-            self.cloud_list.pop(0)
+            final_cloud = np.append(final_cloud, transformed, axis=0)
+
+        ros_transformed = point_cloud(final_cloud, 'velodyne')
+
+        ros_transformed.header = Header(stamp=data_velodyne.header.stamp, frame_id='velodyne')
+        ros_transformed.row_step = ros_transformed.width * ros_transformed.point_step
+        self.pub_aggregated.publish(ros_transformed)
 
 
 if __name__ == "__main__":
